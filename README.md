@@ -26,13 +26,6 @@ A full-featured Hospital Management System built with **Python + Streamlit + SQL
 | Charts | Matplotlib |
 | PDF | ReportLab |
 
-## 🔑 Default Login Credentials
-| Username | Password | Role |
-|---|---|---|
-| admin | admin123 | Admin |
-| doctor1 | doc123 | Doctor |
-| receptionist | rec123 | Receptionist |
-
 ## 📦 Installation
 ```bash
 git clone https://github.com/YOUR_USERNAME/hospital-management.git
