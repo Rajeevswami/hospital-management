@@ -21,15 +21,29 @@ from matplotlib.gridspec import GridSpec
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-@st.cache_resource
 def get_conn():
+    """One PostgreSQL connection per browser session (not shared across users)."""
     url = st.secrets["DATABASE_URL"]
-    conn = psycopg2.connect(url, cursor_factory=RealDictCursor,
-                            connect_timeout=10, keepalives=1,
-                            keepalives_idle=30, keepalives_interval=10,
-                            keepalives_count=5)
-    conn.autocommit = False
+    conn = st.session_state.get("_pg_conn")
+    if conn is not None and conn.closed:
+        st.session_state.pop("_pg_conn", None)
+        conn = None
+    if conn is None:
+        conn = psycopg2.connect(url, cursor_factory=RealDictCursor,
+                                connect_timeout=10, keepalives=1,
+                                keepalives_idle=30, keepalives_interval=10,
+                                keepalives_count=5)
+        conn.autocommit = False
+        st.session_state["_pg_conn"] = conn
     return conn
+
+def _drop_db_conn():
+    old = st.session_state.pop("_pg_conn", None)
+    if old is not None and not old.closed:
+        try:
+            old.close()
+        except Exception:
+            pass
 
 def execute(sql, params=(), fetch_results=False):
     try:
@@ -43,8 +57,8 @@ def execute(sql, params=(), fetch_results=False):
             conn.commit()
             return []
     except psycopg2.OperationalError:
-        # Connection dropped — clear cache and reconnect
-        st.cache_resource.clear()
+        # Connection dropped — reconnect once for this session
+        _drop_db_conn()
         conn = get_conn()
         with conn.cursor() as cur:
             cur.execute(sql, params)
@@ -610,6 +624,7 @@ def sidebar_nav(user):
         st.session_state.page = choice
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🚪  Logout", use_container_width=True):
+            _drop_db_conn()
             st.session_state.logged_in = False
             st.session_state.user = None
             st.rerun()
@@ -896,9 +911,10 @@ def page_billing():
         if bills:
             b_opts = {f"Bill #{r['bill_id']} — {r['name']} — Rs.{r['amount']} ({r['payment_status']})":
                       r for r in bills}
-            sel = st.selectbox("Select Bill", list(b_opts.keys()))
+            sel = st.selectbox("Select Bill", list(b_opts.keys()), key="pdf_bill_select")
             r   = b_opts[sel]
-            if st.button("🖨️ Generate & Download PDF", use_container_width=True):
+            pdf_cache_key = f"bill_pdf_{r['bill_id']}"
+            if st.button("🖨️ Generate PDF Invoice", use_container_width=True, key="gen_bill_pdf"):
                 pdf = generate_pdf({
                     "bill_id":        r["bill_id"],
                     "patient_name":   r["name"],
@@ -911,9 +927,15 @@ def page_billing():
                     "payment_status": r["payment_status"],
                     "description":    r["description"] or "Medical Services",
                 })
-                st.download_button("⬇️ Download PDF Bill", pdf,
+                if pdf.startswith(b"%PDF"):
+                    st.session_state[pdf_cache_key] = pdf
+                else:
+                    st.error(pdf.decode(errors="replace") if isinstance(pdf, bytes) else str(pdf))
+            if pdf_cache_key in st.session_state:
+                st.download_button("⬇️ Download PDF Bill", st.session_state[pdf_cache_key],
                                    f"MediCore_Bill_{r['bill_id']}.pdf",
-                                   "application/pdf", use_container_width=True)
+                                   "application/pdf", use_container_width=True,
+                                   key=f"dl_bill_{r['bill_id']}")
         else: st.info("No bills yet.")
 
     with tab2:
@@ -1085,12 +1107,14 @@ def page_reports():
             with st.spinner("⏳ Generating analytics chart..."):
                 try:
                     buf = dashboard_chart()
-                    st.image(buf, use_container_width=True)
-                    st.download_button("⬇️ Download PNG", buf.getvalue(),
-                                       "MediCore_Dashboard.png","image/png",
-                                       use_container_width=True)
+                    st.session_state["report_dash_png"] = buf.getvalue()
                 except Exception as e:
                     st.error(f"Chart error: {e}")
+        if "report_dash_png" in st.session_state:
+            st.image(io.BytesIO(st.session_state["report_dash_png"]), use_container_width=True)
+            st.download_button("⬇️ Download PNG", st.session_state["report_dash_png"],
+                               "MediCore_Dashboard.png", "image/png",
+                               use_container_width=True, key="dl_dash_png")
 
     with c2:
         st.markdown("""<div style='background:#1A2235;border:1px solid #7B61FF;border-radius:12px;
@@ -1105,12 +1129,14 @@ def page_reports():
             with st.spinner("⏳ Generating patient chart..."):
                 try:
                     buf = patient_chart()
-                    st.image(buf, use_container_width=True)
-                    st.download_button("⬇️ Download PNG", buf.getvalue(),
-                                       "MediCore_Patients.png","image/png",
-                                       use_container_width=True)
+                    st.session_state["report_pat_png"] = buf.getvalue()
                 except Exception as e:
                     st.error(f"Chart error: {e}")
+        if "report_pat_png" in st.session_state:
+            st.image(io.BytesIO(st.session_state["report_pat_png"]), use_container_width=True)
+            st.download_button("⬇️ Download PNG", st.session_state["report_pat_png"],
+                               "MediCore_Patients.png", "image/png",
+                               use_container_width=True, key="dl_pat_png")
 
 # ══════════════════════════════════════════════════════════════
 #  PAGE — USERS
@@ -1142,14 +1168,13 @@ def page_users():
             if st.form_submit_button("💾 Create User", use_container_width=True):
                 if not uname.strip() or not upass:
                     st.error("Username and password are required!")
+                elif fetch("SELECT 1 FROM users WHERE username=%s LIMIT 1", (uname.strip(),)):
+                    st.error("❌ That username is already taken. Choose another.")
                 else:
                     h = hashlib.sha256(upass.encode()).hexdigest()
-                    try:
-                        run("INSERT INTO users(username,password,role,full_name,email) VALUES(%s,%s,%s,%s,%s)",
-                            (uname.strip(),h,urole,fname,email))
-                        st.success(f"✅ User '{uname}' created!"); st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ Error: {e} (username might already exist)")
+                    run("INSERT INTO users(username,password,role,full_name,email) VALUES(%s,%s,%s,%s,%s)",
+                        (uname.strip(),h,urole,fname,email))
+                    st.success(f"✅ User '{uname}' created!"); st.rerun()
 
         st.markdown("---")
         st.subheader("🗑️ Delete User")
